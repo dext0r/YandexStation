@@ -1,7 +1,6 @@
 import binascii
 import json
 import re
-import time
 import uuid
 from datetime import timedelta
 from typing import Optional
@@ -13,10 +12,11 @@ from homeassistant.components.media_player import MediaPlayerEntity
 from homeassistant.components.media_player.const import MEDIA_TYPE_TVSHOW, \
     MEDIA_TYPE_CHANNEL
 from homeassistant.const import STATE_PLAYING, STATE_PAUSED, STATE_IDLE
-from homeassistant.core import callback
+from homeassistant.core import callback, CALLBACK_TYPE
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceRegistry
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt
 
 from . import DOMAIN, DATA_CONFIG, CONF_INCLUDE, CONF_INTENTS
@@ -114,8 +114,6 @@ class YandexStation(MediaPlayerEntity):
     _attr_extra_state_attributes: dict = None
 
     local_state: Optional[dict] = None
-    # для управления громкостью Алисы
-    alice_volume: Optional[dict] = None
 
     # true of false if device has HDMI
     hdmi_audio: Optional[bool] = None
@@ -157,6 +155,9 @@ class YandexStation(MediaPlayerEntity):
         if self.device_platform in CUSTOM:
             info["manufacturer"] = CUSTOM[self.device_platform][1]
             info["model"] = CUSTOM[self.device_platform][2]
+
+        self._unsub_restore_volume_level: Optional[CALLBACK_TYPE] = None
+        self._volume_level_before_tts: Optional[float] = None
 
         # backward compatibility
         self.entity_id = "media_player.yandex_station_" + \
@@ -364,48 +365,30 @@ class YandexStation(MediaPlayerEntity):
         ]
         await self.hass.async_add_executor_job(data.save)
 
-    def _check_set_alice_volume(self, extra: dict, dialog: bool):
-        alice_volume = extra.get('volume_level')
-        # если громкости голоса нет, или уже есть активная громкость, или
-        # громкость голоса равна текущей громкости колонки - ничего не делаем
-        if (not alice_volume or self.alice_volume or
-                alice_volume == self.volume_level):
+    async def _async_restore_volume_level(self, *_):
+        if self._volume_level_before_tts is None:
             return
 
-        self.alice_volume = {
-            'volume_level': alice_volume,
-            'wait_state': 'BUSY',
-            'wait_ts': time.time() + 30
-        }
+        if self._unsub_restore_volume_level:
+            self._unsub_restore_volume_level()
+            self._unsub_restore_volume_level = None
 
-        # для локального TTS не жём статус BUSY
-        if dialog:
-            self._process_alice_volume('BUSY')
+        await self.async_set_volume_level(self._volume_level_before_tts)
+        self._volume_level_before_tts = None
 
-    def _process_alice_volume(self, alice_state: str):
-        volume = None
+    async def _async_set_volume_level_for_tts(self, target_volume_level: float):
+        if not target_volume_level or \
+                self._unsub_restore_volume_level or \
+                target_volume_level == self.volume_level:
+            return
 
-        # если что-то пошло не так, через 30 секунд возвращаем громкость
-        if time.time() > self.alice_volume['wait_ts']:
-            volume = self.alice_volume['prev_volume']
-            self.alice_volume = None
+        if self._unsub_restore_volume_level:
+            self._unsub_restore_volume_level()
 
-        elif self.alice_volume['wait_state'] == alice_state:
-            if alice_state == 'BUSY':
-                volume = self.alice_volume['volume_level']
-                self.alice_volume['prev_volume'] = self.volume_level
-                self.alice_volume['wait_state'] = 'SPEAKING'
+        self._unsub_restore_volume_level = async_call_later(self.hass, 30, self._async_restore_volume_level)
+        self._volume_level_before_tts = 0 if self.is_volume_muted else self.volume_level
 
-            elif alice_state == 'SPEAKING':
-                self.alice_volume['wait_state'] = 'IDLE'
-
-            elif alice_state == 'IDLE':
-                volume = self.alice_volume['prev_volume']
-                self.alice_volume = None
-
-        if volume:
-            coro = self.async_set_volume_level(volume)
-            self.hass.create_task(coro)
+        await self.async_set_volume_level(target_volume_level)
 
     @callback
     def yandex_dialog(self, media_type: str, media_id: str):
@@ -492,12 +475,9 @@ class YandexStation(MediaPlayerEntity):
 
         self.local_state = state
 
-        # возвращаем из состояния mute, если нужно
-        # if self.prev_volume and state['volume']:
-        #     self.prev_volume = None
-
-        if self.alice_volume:
-            self._process_alice_volume(state['aliceState'])
+        if state['aliceState'] == 'IDLE':
+            if self._attr_extra_state_attributes.get('alice_state') in ['SPEAKING', 'LISTENING', 'BUSY']:
+                self.hass.create_task(self._async_restore_volume_level())
 
         extra_item = extra_stream = None
 
@@ -795,9 +775,11 @@ class YandexStation(MediaPlayerEntity):
                 # не продолжала слушать
                 extra = kwargs.get("extra")
                 if self.quasar.session.x_token and not extra.get("force_local"):
+                    volume_level = kwargs.get('extra', {}).get('volume_level')
+                    if volume_level:
+                        await self._async_set_volume_level_for_tts(volume_level)
+
                     media_id = utils.fix_cloud_text(media_id)
-                    if extra:
-                        self._check_set_alice_volume(extra, False)
                     await self.quasar.send(self.device, media_id, is_tts=True)
                     return
 
@@ -809,8 +791,10 @@ class YandexStation(MediaPlayerEntity):
                 payload = {'command': 'sendText', 'text': media_id}
 
             elif media_type == 'dialog':
-                if 'extra' in kwargs:
-                    self._check_set_alice_volume(kwargs['extra'], True)
+                volume_level = kwargs.get('extra', {}).get('volume_level')
+                if volume_level:
+                    await self._async_set_volume_level_for_tts(volume_level)
+
                 payload = utils.update_form(
                     'personal_assistant.scenarios.repeat_after_me',
                     request=media_id)
