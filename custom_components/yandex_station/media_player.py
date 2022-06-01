@@ -8,15 +8,17 @@ from typing import Optional
 import yaml
 from homeassistant.components import shopping_list
 from homeassistant.components.media_player import *
-from homeassistant.components.media_player import MediaPlayerEntity
-from homeassistant.components.media_player.const import MEDIA_TYPE_TVSHOW, \
-    MEDIA_TYPE_CHANNEL
+from homeassistant.components.media_player.const import (
+    MEDIA_TYPE_TVSHOW, MEDIA_TYPE_CHANNEL, MEDIA_CLASS_APP
+)
+from homeassistant.components.media_source.models import BrowseMediaSource
 from homeassistant.const import STATE_PLAYING, STATE_PAUSED, STATE_IDLE
 from homeassistant.core import callback, CALLBACK_TYPE
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceRegistry
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.template import Template
 from homeassistant.util import dt
 
 from . import DOMAIN, DATA_CONFIG, CONF_INCLUDE, CONF_INTENTS
@@ -35,8 +37,8 @@ RE_SHOPPING = re.compile(r'^\d+\) (.+)\.$', re.MULTILINE)
 
 BASE_FEATURES = (
         SUPPORT_TURN_OFF | SUPPORT_VOLUME_SET | SUPPORT_VOLUME_STEP |
-        SUPPORT_VOLUME_MUTE | SUPPORT_PLAY_MEDIA | SUPPORT_SELECT_SOUND_MODE |
-        SUPPORT_TURN_ON
+        SUPPORT_VOLUME_MUTE | SUPPORT_PLAY_MEDIA | SUPPORT_TURN_ON |
+        SUPPORT_BROWSE_MEDIA
 )
 
 CLOUD_FEATURES = (
@@ -47,8 +49,13 @@ LOCAL_FEATURES = (
         BASE_FEATURES | SUPPORT_PLAY | SUPPORT_PAUSE | SUPPORT_SELECT_SOURCE
 )
 
-SOUND_MODE1 = "Произнеси текст"
-SOUND_MODE2 = "Выполни команду"
+MEDIA_DEFAULT = [{
+    "title": "Произнеси текст", "media_content_type": "text",
+    "thumbnail": "https://brands.home-assistant.io/_/tts/icon.png",
+}, {
+    "title": "Выполни команду", "media_content_type": "command",
+    "thumbnail": "https://brands.home-assistant.io/_/automation/icon.png",
+}]
 
 SOURCE_STATION = 'Станция'
 SOURCE_HDMI = 'HDMI'
@@ -110,7 +117,58 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
 
 
 # noinspection PyAbstractClass
-class YandexStation(MediaPlayerEntity):
+class YandexSource(BrowseMediaSource):
+    def __init__(self, **kwargs):
+        query = {}
+        if kwargs.get("media_content_id"):
+            query["message"] = kwargs.pop("media_content_id")
+            kwargs.setdefault("can_expand", False)
+        if kwargs.get("template"):
+            query["template"] = template = kwargs.pop("template")
+            kwargs.setdefault("can_expand", "message" in template)
+        if kwargs.get("extra"):
+            extra = kwargs.pop("extra")
+            query["volume_level"] = extra["volume_level"]
+        if query:
+            kwargs["identifier"] = utils.encode_media_source(query)
+
+        kwargs = {
+            "domain": "tts",  # will show message/say dialog
+            "identifier": DOMAIN,  # may be any but not empty
+            "media_class": MEDIA_CLASS_APP,  # needs for icon
+            "can_play": False,  # show play button in
+            "can_expand": True,  # true - show say dialog, false - run command
+            **kwargs  # override all default values
+        }
+        super().__init__(**kwargs)
+
+
+# noinspection PyAbstractClass
+class MediaBrowser(MediaPlayerEntity):
+    media_cache: list = None
+
+    async def async_browse_media(
+            self, media_content_type: str = None, media_content_id: str = None,
+    ) -> BrowseMedia:
+        if not MediaBrowser.media_cache:
+            conf = self.hass.data[DOMAIN][DATA_CONFIG]
+            conf = conf.get("media_source") or MEDIA_DEFAULT
+            MediaBrowser.media_cache = [YandexSource(**item) for item in conf]
+
+        for media in MediaBrowser.media_cache:
+            if (media.media_content_id == media_content_id and
+                    media.media_content_type == media_content_type):
+                return media
+
+        return BrowseMediaSource(
+            title=self.name, children=MediaBrowser.media_cache,
+            domain=None, identifier=None, media_class=None,
+            media_content_type=None, can_play=False, can_expand=True,
+        )
+
+
+# noinspection PyAbstractClass
+class YandexStation(MediaBrowser):
     _attr_extra_state_attributes: dict = None
 
     local_state: Optional[dict] = None
@@ -142,8 +200,6 @@ class YandexStation(MediaPlayerEntity):
         self._attr_name = device['name']
         self._attr_should_poll = True
         self._attr_state = STATE_IDLE
-        self._attr_sound_mode_list = [SOUND_MODE1, SOUND_MODE2]
-        self._attr_sound_mode = SOUND_MODE1
         self._attr_supported_features = CLOUD_FEATURES
         self._attr_volume_level = 0.5
         self._attr_unique_id = device['quasar_info']['device_id']
@@ -184,7 +240,9 @@ class YandexStation(MediaPlayerEntity):
         if self.sync_sources is not None:
             return
 
-        self.sync_sources = utils.get_media_players(self.hass)
+        self.sync_sources = {
+            src["name"]: src for src in utils.get_media_players(self.hass)
+        }
 
         # for HomeKit source list support
         self._attr_device_class = DEVICE_CLASS_TV
@@ -201,8 +259,8 @@ class YandexStation(MediaPlayerEntity):
         # load state if unknown
         if self.hdmi_audio is None:
             try:
-                device_config = await self.quasar.get_device_config(self.device)
-                self.hdmi_audio = device_config.get('hdmiAudio', False)
+                conf = await self.quasar.get_device_config(self.device)
+                self.hdmi_audio = conf.get('hdmiAudio', False)
             except:
                 _LOGGER.warning("Не получается получить настройки HDMI")
                 return
@@ -418,14 +476,21 @@ class YandexStation(MediaPlayerEntity):
     @callback
     def async_sync_state(self, service: str, **kwargs):
         self.debug(f"Sync state: {service}")
+
+        source = self.sync_sources[self._attr_source]
+        if source.get("sync_volume") is False and service == "volume_set":
+            return
+
         if service == "play_media":
             self.hass.async_create_task(self.async_media_seek(0))
-
             kwargs["media_content_id"] = utils.StreamingView.get_url(
-                self.hass, self._attr_unique_id, kwargs["media_content_id"]
+                self.hass, self._attr_unique_id, kwargs.pop("url")
+            )
+            kwargs["media_content_type"] = source.get(
+                "media_content_type", "music"
             )
 
-        kwargs["entity_id"] = self.sync_sources[self._attr_source]
+        kwargs["entity_id"] = source["entity_id"]
 
         self.hass.async_create_task(self.hass.services.async_call(
             "media_player", service, kwargs
@@ -433,6 +498,8 @@ class YandexStation(MediaPlayerEntity):
 
     @callback
     def update_device_info(self, sw_version: str):
+        if not self.hass:
+            return
         registry: DeviceRegistry = self.hass.data['device_registry']
         device = registry.async_get_device(
             {(DOMAIN, self._attr_unique_id)}, None
@@ -517,10 +584,9 @@ class YandexStation(MediaPlayerEntity):
                 pass
 
             try:
-                if mctp == 'music':
+                if pstate['extra'].get('stateType') in ('music', 'radio'):
                     url = pstate['extra']['coverURI']
-                    if url:
-                        miur = 'https://' + url.replace('%%', '400x400')
+                    miur = 'https://' + url.replace('%%', '400x400')
                 elif extra_item:
                     miur = extra_item['thumbnail_url_16x9']
             except:
@@ -529,9 +595,7 @@ class YandexStation(MediaPlayerEntity):
             mdur = pstate["duration"]
             mpos = pstate["progress"]
             mart = pstate["subtitle"]
-
-            mtit = pstate["title"] + ". " + pstate["subtitle"] \
-                if pstate.get("subtitle") else pstate["title"]
+            mtit = pstate["title"]
 
             stat = STATE_PLAYING if state["playing"] else STATE_PAUSED
             if pstate["hasPrev"]:
@@ -550,9 +614,7 @@ class YandexStation(MediaPlayerEntity):
                             # запускаем новую песню, если ID изменился
                             if extra_stream:
                                 self.async_sync_state(
-                                    "play_media",
-                                    media_content_id=extra_stream["url"],
-                                    media_content_type="music"
+                                    "play_media", url=extra_stream["url"],
                                 )
                             self.sync_id = pstate["id"]
                         else:
@@ -576,7 +638,9 @@ class YandexStation(MediaPlayerEntity):
                         # включаем громкость колонки, когда с ней разговариваем
                         if state["aliceState"] != "IDLE":
                             self.sync_mute = False
-                            self.hass.create_task(self.async_mute_volume(False))
+                            self.hass.create_task(
+                                self.async_mute_volume(False)
+                            )
                     else:
                         # выключаем громкость колонки, когда с ней не
                         # разговариваем
@@ -644,7 +708,7 @@ class YandexStation(MediaPlayerEntity):
         self.sync_state = self.sync_sources and source in self.sync_sources
 
         self._attr_source = source
-        self.async_schedule_update_ha_state()
+        self.async_write_ha_state()
 
         await self.sync_hdmi_audio()
 
@@ -733,19 +797,35 @@ class YandexStation(MediaPlayerEntity):
         await self.quasar.update_online_stats()
         self._attr_available = self.device.get('online', False)
 
-    async def async_play_media(self, media_type: str, media_id: str, **kwargs):
+    async def async_play_media(
+            self, media_type: str, media_id: str, extra: dict = None, **kwargs
+    ):
+        # backward support Hass lower than v2022.3
         if '/api/tts_proxy/' in media_id:
             session = async_get_clientsession(self.hass)
             media_id = await utils.get_tts_message(session, media_id)
             media_type = 'tts'
 
+        if media_id.startswith("media-source://tts/"):
+            query = utils.decode_media_source(media_id)
+            if query.get("template"):
+                template = Template(query.pop("template"), self.hass)
+                media_id = template.async_render(query)
+            else:
+                media_id = query["message"]
+            if query.get("volume_level"):
+                extra.setdefault("volume_level", float(query["volume_level"]))
+            # provider, music - from 3rd party TTS (ex google)
+            if media_type in ("provider", "music"):
+                media_type = "text"
+
         if not media_id:
             _LOGGER.warning(f"Получено пустое media_id")
             return
 
-        if media_type == 'tts':
-            media_type = 'text' if self.sound_mode == SOUND_MODE1 \
-                else 'command'
+        # tts for backward compatibility
+        if media_type == "tts":
+            media_type = "text"
         elif media_type == 'brightness':
             await self._set_brightness(media_id)
             return
@@ -773,9 +853,8 @@ class YandexStation(MediaPlayerEntity):
             elif media_type == 'text':
                 # даже в локальном режиме делам TTS через облако, чтоб колонка
                 # не продолжала слушать
-                extra = kwargs.get("extra")
                 if self.quasar.session.x_token and not extra.get("force_local"):
-                    volume_level = kwargs.get('extra', {}).get('volume_level')
+                    volume_level = extra.get('volume_level')
                     if volume_level:
                         await self._async_set_volume_level_for_tts(volume_level)
 
@@ -791,7 +870,7 @@ class YandexStation(MediaPlayerEntity):
                 payload = {'command': 'sendText', 'text': media_id}
 
             elif media_type == 'dialog':
-                volume_level = kwargs.get('extra', {}).get('volume_level')
+                volume_level = extra.get('volume_level')
                 if volume_level:
                     await self._async_set_volume_level_for_tts(volume_level)
 
